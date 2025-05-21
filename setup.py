@@ -12,11 +12,9 @@ with open(os.path.join(here, "seam_carving", "__init__.py")) as f:
 setuptools.setup(
     name="seam-carving",
     version=version,
-    author="Jiahao Li",
-    author_email="liplus17@163.com",
-    maintainer="Jiahao Li",
-    maintainer_email="liplus17@163.com",
-    url="https://github.com/li-plus/seam-carving",
+    author="Taylor Archibald",
+    author_email="tahlor@gmail.com",
+    url="https://github.com/tahlor/seam-carving",
     description="A super-fast Python implementation of seam carving algorithm "
     "for intelligent image resizing.",
     long_description=open(os.path.join(here, "README.md")).read(),
