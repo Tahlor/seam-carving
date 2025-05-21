@@ -1,6 +1,6 @@
 import warnings
 from enum import Enum
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple
 
 import numba as nb
 import numpy as np
@@ -194,30 +194,18 @@ def _get_forward_seams(
 
 
 def _get_seams(
-    gray: np.ndarray,
-    num_seams: int,
-    energy_mode: str,
-    aux_energy: Optional[np.ndarray],
-    *,
-    energy_map: Optional[np.ndarray] = None,
-    recompute_energy: bool = True,
+    gray: np.ndarray, num_seams: int, energy_mode: str, aux_energy: Optional[np.ndarray]
 ) -> np.ndarray:
+    """Get the minimum N seams from the grayscale image"""
     gray = np.asarray(gray, dtype=np.float32)
-    if energy_map is not None:  # user-supplied
-        energy = energy_map.astype(np.float32).copy()
-        aux_energy = None  # already baked-in
-        recompute_energy = False
-    else:
-        energy = _get_energy(gray)
-        if aux_energy is not None:
-            energy += aux_energy
     if energy_mode == EnergyMode.BACKWARD:
-        if recompute_energy:
-            return _get_backward_seams(gray, num_seams, aux_energy)
-        return _get_backward_seams_static(energy, num_seams)
-    if energy_mode == EnergyMode.FORWARD and recompute_energy:
+        return _get_backward_seams(gray, num_seams, aux_energy)
+    elif energy_mode == EnergyMode.FORWARD:
         return _get_forward_seams(gray, num_seams, aux_energy)
-    raise ValueError("Forward mode without recomputation is not supported; use energy_mode='backward' or set recompute_energy=True.")
+    else:
+        raise ValueError(
+            f"expect energy_mode to be one of {_list_enum(EnergyMode)}, got {energy_mode}"
+        )
 
 
 def _reduce_width(
@@ -225,26 +213,22 @@ def _reduce_width(
     delta_width: int,
     energy_mode: str,
     aux_energy: Optional[np.ndarray],
-    seam_dump: Optional[List[np.ndarray]] = None,
-    energy_map: Optional[np.ndarray] = None,
-    recompute_energy: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Reduce the width of image by delta_width pixels"""
     assert src.ndim in (2, 3) and delta_width >= 0
-    gray = src if src.ndim == 2 else _rgb2gray(src)
-    seams = _get_seams(gray, delta_width, energy_mode, aux_energy, energy_map=energy_map, recompute_energy=recompute_energy)
-    if seam_dump is not None:
-        seam_dump.append(seams)
-    to_keep = ~seams
     if src.ndim == 2:
-        h, w = src.shape
-        dst = src[to_keep].reshape((h, w - delta_width))
+        gray = src
+        src_h, src_w = src.shape
+        dst_shape: Tuple[int, ...] = (src_h, src_w - delta_width)
     else:
-        h, w, c = src.shape
-        dst = src[to_keep].reshape((h, w - delta_width, c))
+        gray = _rgb2gray(src)
+        src_h, src_w, src_c = src.shape
+        dst_shape = (src_h, src_w - delta_width, src_c)
+
+    to_keep = ~_get_seams(gray, delta_width, energy_mode, aux_energy)
+    dst = src[to_keep].reshape(dst_shape)
     if aux_energy is not None:
-        aux_energy = aux_energy[to_keep].reshape(dst.shape[:2])
-    if energy_map is not None:
-        energy_map[:] = energy_map[to_keep].reshape(dst.shape[:2])
+        aux_energy = aux_energy[to_keep].reshape(dst_shape[:2])
     return dst, aux_energy
 
 
@@ -287,25 +271,23 @@ def _expand_width(
     energy_mode: str,
     aux_energy: Optional[np.ndarray],
     step_ratio: float,
-    seam_dump: Optional[List[np.ndarray]] = None,
-    energy_map: Optional[np.ndarray] = None,
-    recompute_energy: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    assert 0 < step_ratio <= 1
+    """Expand the width of image by delta_width pixels"""
+    assert src.ndim in (2, 3) and delta_width >= 0
+    if not 0 < step_ratio <= 1:
+        raise ValueError(f"expect `step_ratio` to be between (0,1], got {step_ratio}")
+
     dst = src
-    while delta_width:
-        max_step = max(1, round(step_ratio * dst.shape[1]))
-        step = min(max_step, delta_width)
+    while delta_width > 0:
+        max_step_size = max(1, round(step_ratio * dst.shape[1]))
+        step_size = min(max_step_size, delta_width)
         gray = dst if dst.ndim == 2 else _rgb2gray(dst)
-        seams = _get_seams(gray, step, energy_mode, aux_energy, energy_map=energy_map, recompute_energy=recompute_energy)
-        if seam_dump is not None:
-            seam_dump.append(seams)
-        dst = _insert_seams(dst, seams, step)
+        seams = _get_seams(gray, step_size, energy_mode, aux_energy)
+        dst = _insert_seams(dst, seams, step_size)
         if aux_energy is not None:
-            aux_energy = _insert_seams(aux_energy, seams, step)
-        if energy_map is not None:
-            energy_map = _insert_seams(energy_map, seams, step)
-        delta_width -= step
+            aux_energy = _insert_seams(aux_energy, seams, step_size)
+        delta_width -= step_size
+
     return dst, aux_energy
 
 
@@ -345,24 +327,16 @@ def _resize_height(
     energy_mode: str,
     aux_energy: Optional[np.ndarray],
     step_ratio: float,
-    seam_dump: Optional[List[np.ndarray]] = None,
-    energy_map: Optional[np.ndarray] = None,
-    recompute_energy: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Resize the height of image by removing horizontal seams"""
+    assert src.ndim in (2, 3) and height > 0
     if aux_energy is not None:
         aux_energy = aux_energy.T
-    if energy_map is not None:
-        energy_map = energy_map.T
     src = _transpose_image(src)
-    if src.shape[1] > height:
-        src, aux_energy = _reduce_width(src, abs(src.shape[1] - height), energy_mode, aux_energy, seam_dump, energy_map, recompute_energy)
-    else:
-        src, aux_energy = _expand_width(src, height - src.shape[1], energy_mode, aux_energy, step_ratio, seam_dump, energy_map, recompute_energy)
+    src, aux_energy = _resize_width(src, height, energy_mode, aux_energy, step_ratio)
     src = _transpose_image(src)
     if aux_energy is not None:
         aux_energy = aux_energy.T
-    if energy_map is not None:
-        energy_map = energy_map.T
     return src, aux_energy
 
 
@@ -518,156 +492,4 @@ def remove_object(
         if keep_mask is not None:
             keep_mask = _remove_seam_mask(keep_mask, seam_mask)
 
-    return src
-
-
-def _get_backward_seams_static(energy: np.ndarray, num_seams: int) -> np.ndarray:
-    """Remove *num_seams* using the *initial* energy only (fast)."""
-    h, w = energy.shape
-    seams = np.zeros((h, w), dtype=bool)
-    rows = np.arange(h, dtype=np.int32)
-    idx_map = np.broadcast_to(np.arange(w, dtype=np.int32), (h, w))
-    for _ in range(num_seams):
-        seam = _get_backward_seam(energy)
-        seams[rows, idx_map[rows, seam]] = True
-        seam_mask = _get_seam_mask(energy, seam)
-        energy = _remove_seam_mask(energy, seam_mask)
-        idx_map = _remove_seam_mask(idx_map, seam_mask)
-    return seams
-
-
-def _prune_low_energy(src: np.ndarray, energy: np.ndarray, thr: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Remove *entire* rows / columns whose **mean** energy < thr."""
-    keep_rows = energy.mean(1) >= thr
-    keep_cols = energy.mean(0) >= thr
-    src = src[np.ix_(keep_rows, keep_cols, *([slice(None)] if src.ndim == 3 else []))]
-    energy = energy[np.ix_(keep_rows, keep_cols)]
-    return src, energy
-
-
-def _overlay_seams(seam_list: List[np.ndarray], final_shape: Tuple[int, int], dtype) -> np.ndarray:
-    """Return RGB mask of every removed / inserted seam."""
-    h, w = final_shape
-    vis = np.zeros((h, w, 3), dtype=dtype)
-    for mask in seam_list:
-        if mask.shape != (h, w):
-            pad_h = h - mask.shape[0]
-            pad_w = w - mask.shape[1]
-            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), constant_values=False)
-        vis[mask] = (255, 0, 0)
-    return vis
-
-
-def _erase_object(
-    src: np.ndarray,
-    drop_mask: np.ndarray,
-    energy_mode: str,
-    order: str,
-    aux_energy: Optional[np.ndarray],
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Factored out from old resize for clarity (logic identical)."""
-    if order == OrderMode.HEIGHT_FIRST:
-        src = _transpose_image(src)
-        aux_energy = aux_energy.T
-    num_seams = (aux_energy < 0).sum(1).max()
-    while num_seams:
-        src, aux_energy = _reduce_width(src, num_seams, energy_mode, aux_energy)
-        num_seams = (aux_energy < 0).sum(1).max()
-    if order == OrderMode.HEIGHT_FIRST:
-        src = _transpose_image(src)
-        aux_energy = aux_energy.T
-    return src, aux_energy
-
-
-def resize_advanced(
-    src: np.ndarray,
-    size: Optional[Tuple[int, int]] = None,
-    energy_mode: str = "backward",
-    order: str = "width-first",
-    keep_mask: Optional[np.ndarray] = None,
-    drop_mask: Optional[np.ndarray] = None,
-    step_ratio: float = 0.5,
-    *,
-    energy_map: Optional[np.ndarray] = None,
-    recompute_energy: bool = True,
-    energy_threshold: Optional[float] = None,
-    visualize: bool = False,
-) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-    """Content‑aware resize with four new options.
-
-    New keyword‑only parameters
-    ---------------------------
-    energy_map
-        Pre‑computed energy to drive seam selection.  Must match ``src.shape[:2]``.
-    recompute_energy
-        If *False*, the _initial_ energy is computed once (or taken from
-        ``energy_map``) and then **never recomputed** as seams are carved.
-        This is faster but less accurate.
-    energy_threshold
-        Cut every complete **row and column** whose *mean* energy is below
-        this threshold *before* any seam carving.
-    visualize
-        If *True*, also return an RGB image with **all removed / inserted
-        seams over‑laid in red**.
-
-    The original semantics are otherwise unchanged.
-    """
-    src = _check_src(src)
-    if order not in _list_enum(OrderMode):
-        raise ValueError(f"expect order to be one of {_list_enum(OrderMode)}, got {order}")
-    if energy_threshold is not None:
-        gray = src if src.ndim == 2 else _rgb2gray(src)
-        emap = _get_energy(gray) if energy_map is None else np.asarray(energy_map, float)
-        src, energy_map = _prune_low_energy(src, emap, energy_threshold)
-    aux_energy = None
-    if keep_mask is not None:
-        keep_mask = _check_mask(keep_mask, src.shape[:2])
-        aux_energy = np.zeros(src.shape[:2], dtype=np.float32)
-        aux_energy[keep_mask] += KEEP_MASK_ENERGY
-    if drop_mask is not None:
-        drop_mask = _check_mask(drop_mask, src.shape[:2])
-        if aux_energy is None:
-            aux_energy = np.zeros(src.shape[:2], dtype=np.float32)
-        aux_energy[drop_mask] -= DROP_MASK_ENERGY
-        src, aux_energy = _erase_object(src, drop_mask, energy_mode, order, aux_energy)
-    seam_vis: List[np.ndarray] = []
-    def _carve_along_width(img, target_w, aux):
-        nonlocal energy_map
-        delta = abs(img.shape[1] - target_w)
-        if delta == 0:
-            return img, aux
-        if img.shape[1] < target_w:
-            return _expand_width(
-                img, delta, energy_mode, aux, step_ratio,
-                seam_vis if visualize else None,
-                energy_map, recompute_energy,
-            )
-        return _reduce_width(
-            img, delta, energy_mode, aux,
-            seam_vis if visualize else None,
-            energy_map, recompute_energy,
-        )
-    def _carve_along_height(img, target_h, aux):
-        nonlocal energy_map
-        delta = abs(img.shape[0] - target_h)
-        if delta == 0:
-            return img, aux
-        return _resize_height(
-            img, target_h, energy_mode, aux, step_ratio,
-            seam_vis if visualize else None,
-            energy_map, recompute_energy,
-        )
-    if size is not None:
-        width, height = map(int, size)
-        if width <= 0 or height <= 0:
-            raise ValueError(f"expect positive size, got {size!r}")
-        if order == OrderMode.WIDTH_FIRST:
-            src, aux_energy = _carve_along_width(src, width, aux_energy)
-            src, aux_energy = _carve_along_height(src, height, aux_energy)
-        else:
-            src, aux_energy = _carve_along_height(src, height, aux_energy)
-            src, aux_energy = _carve_along_width(src, width, aux_energy)
-    if visualize:
-        overlay = _overlay_seams(seam_vis, src.shape[:2], src.dtype)
-        return src, overlay
     return src
